@@ -398,6 +398,7 @@ class BlacklistServerClass:
     def read_blacklist_xlsx(self, blacklist_xlsx_path):
         '''从xlsx文件中读取黑名单（合并到内存）'''
         if not os.path.exists(blacklist_xlsx_path):
+            self.logger.error(f"黑名单 excel 文件不存在：{blacklist_xlsx_path}")
             return
         self.logger.info("正在读取 黑名单 excel 文件")
         wb = openpyxl.load_workbook(blacklist_xlsx_path)
