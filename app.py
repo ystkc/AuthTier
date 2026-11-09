@@ -26,7 +26,7 @@ from slowapi.errors import RateLimitExceeded
 from pydantic import BaseModel, SecretStr
 
 from src.blacklist_utils import BlacklistServerClass, User, guest_user
-from src.blacklist_utils import USER_TYPE_ADMIN, USER_TYPE_GUEST, USER_TYPE_KING
+from src.blacklist_utils import USER_TYPE_ADMIN, USER_TYPE_INITIAL_ADMIN, USER_TYPE_GUEST, USER_TYPE_KING, USER_TYPE_STR_MAP
 from src.config import Config, DEFAULT_AUTH_CODE, DEFAULT_MAIL
 
 SESSION_EXPIRE_TIME = 300 # 会话过期时间，单位秒
@@ -45,6 +45,7 @@ ACCOUNT_OPERATIONS = {
 }
 
 
+SYSTEM_NAME = "(系统名称)"
 USER_RESEND_TIME = 60 # 同一用户连续两次发送验证码的最短间隔时间
 SERVER_RESEND_TIME = 20 # 服务器连续两次发送验证码的最短间隔时间
 EXPIRE_TIME = 600 # 验证码有效期（秒）
@@ -300,7 +301,7 @@ def get_current_user(request: Request) -> User:
 
 # === API端点 ===
 @app.post("/bapi/login")
-@limiter.limit("5/minute")
+@limiter.limit("3/minute")
 async def login(request: Request, form: LoginForm):
     '''登录接口'''
     try:
@@ -312,6 +313,8 @@ async def login(request: Request, form: LoginForm):
             return restful(user, 200, "登录成功", None, form.remember_me)
         return restful(guest_user, 401, "无效的用户名或密码")
     except Exception:
+        import traceback
+        traceback.print_exc()
         logger.error("login ERROR from IP: %s", request.client.host)
         return restful(guest_user, 401, "无效的用户名或密码")
 
@@ -364,8 +367,12 @@ async def bapi_send_verify_code(request: Request, user: User = Depends(get_curre
     except (ValueError, TypeError):
         return restful(guest_user, 400, "请使用旧版QQ邮箱注册")
     email_exist = blacklist_server.check_exist_user(qq_id) # 有可能是重置密码
-    if operation == ACCOUNT_REGISTER and user.type == USER_TYPE_GUEST and email_exist:
+    is_admin = user.type in (USER_TYPE_ADMIN, USER_TYPE_INITIAL_ADMIN) or not blacklist_server.has_admin # 初始管理员也需要发送验证码
+    is_self_modify = user.qq_id == qq_id or not blacklist_server.has_admin
+    if operation == ACCOUNT_REGISTER and email_exist and not is_admin:
         return restful(guest_user, 400, "该邮箱已被注册")
+    if operation == ACCOUNT_MODIFY_INFO and not is_self_modify and not is_admin: # 非管理员不能修改别人的
+        return restful(guest_user, 403, "权限不足")
     # 检查发送频率 (60秒内只能发送一次)
     rest_time = redis_client.ttl(f"vcode_limit:{recv_email}")
     if rest_time != -2:
@@ -384,7 +391,7 @@ async def bapi_send_verify_code(request: Request, user: User = Depends(get_curre
     redis_client.setex("vcode_limit:server", SERVER_RESEND_TIME, 1) # 限制服务器请求发送频率
 
     try:
-        message = f"您正在<u>黑名单系统</u>注册账号或修改资料，您的验证码是: <b>{verification_code}</b>。\
+        message = f"您正在<u>{SYSTEM_NAME}黑名单系统</u>注册账号或修改资料，您的验证码是: <b>{verification_code}</b>。\
 验证码{EXPIRE_TIME//60}分钟有效，输错超过{MAX_VERIFY_FAIL_COUNT}次将失效，请勿泄露给他人。"
         if config.DEBUG_DO_NOT_SEND_EMAIL:
             logger.info("[config.DEBUG_DO_NOT_SEND_EMAIL] 验证码：%s (%s <- %s)",
@@ -457,6 +464,7 @@ def verify_password(password, is_register):
     return True
 
 @app.post('/bapi/verify')
+@limiter.limit("10/minute")
 async def bapi_verify(request: Request, user: User = Depends(get_current_user)):
     """修改个人信息接口（需要邮箱验证码）"""
     item = await request.json()
@@ -469,11 +477,12 @@ async def bapi_verify(request: Request, user: User = Depends(get_current_user)):
     except AssertionError:
         return restful(guest_user, 400, '请使用QQ邮箱注册')
     except (ValueError, TypeError):
-        return restful(guest_user, 400, "请使用旧版QQ邮箱注册")
-    is_admin = user.type == USER_TYPE_ADMIN if user.qq_id != qq_id else False
-        # 安全起见，管理员修改自己信息需要验证码，且不允许修改自己的类型
+        return restful(guest_user, 400, "请使用纯数字QQ邮箱注册")
+    is_admin = user.type in (USER_TYPE_ADMIN, USER_TYPE_INITIAL_ADMIN) or not blacklist_server.has_admin
+    is_self_modify = user.qq_id == qq_id or not blacklist_server.has_admin
+    can_bypass_vcode = is_admin and not is_self_modify  # 安全起见，管理员修改自己信息需要验证码
     vcode = redis_client.get(f"vcode:{recv_email}")
-    if not vcode and not is_admin:
+    if not vcode and not can_bypass_vcode:
         return restful(user, 400, "验证码错误或已失效")
     password = item.get('password', '')
     confirm_password = item.get('confirm_password', '')
@@ -485,7 +494,8 @@ async def bapi_verify(request: Request, user: User = Depends(get_current_user)):
         operation_name = ACCOUNT_OPERATIONS[operation]
     except (ValueError, TypeError):
         return restful(user, 400, "无效的操作类型")
-    if operation == ACCOUNT_REGISTER and email_exist and user.qq_id != qq_id and not is_admin:
+    if operation == ACCOUNT_REGISTER and email_exist and not is_self_modify and not is_admin:
+        # 可以修改自己的信息，或者管理员可以修改别人的信息
         return restful(user, 403, '该邮箱已被注册')
     unique_id = None
     try:
@@ -493,27 +503,35 @@ async def bapi_verify(request: Request, user: User = Depends(get_current_user)):
             unique_id = int(item.get('unique_id', ''))
     except (ValueError, TypeError):
         return restful(user, 400, 'bczId必须为数字')
-    user_type = item.get('user_type')
     old_user_type, _ = blacklist_server.get_register_type(qq_id)
-    if blacklist_server.has_admin:
-        if user_type and user_type != old_user_type and not is_admin:
-            return restful(user, 403, '不能修改用户类型')
-    else:
-        if is_admin:
-            return restful(user, 403, '第一个用户必须是管理员')
-    input_code = None
-    try:
-        if not is_admin:
-            input_code = int(item.get('code', ''))
-    except (ValueError, TypeError):
-        return restful(user, 400, '验证码必须为数字')
-    if not is_admin and int(vcode) != input_code:
-        if redis_client.get(f"vcode_fail_count:{recv_email}") >= MAX_VERIFY_FAIL_COUNT:
-            redis_client.delete(f"vcode:{recv_email}") # 超过最大次数，删除验证码
-            redis_client.delete(f"vcode_fail_count:{recv_email}")
+    user_type = item.get('user_type', old_user_type)
+    if user_type != old_user_type:
+        if blacklist_server.has_admin:
+            if user_type == USER_TYPE_GUEST:
+                return restful(user, 403, '不能降级为访客')
+            if user_type not in USER_TYPE_STR_MAP: # 输入的user_type不存在
+                return restful(user, 400, '无效的用户类型')
+            if user_type and user_type != old_user_type and not is_admin:
+                return restful(user, 403, '不能修改用户类型')
+            if (user_type == USER_TYPE_ADMIN or old_user_type == USER_TYPE_ADMIN) and user.type != USER_TYPE_INITIAL_ADMIN: # 只有初始管理员可以增删管理员
+                return restful(user, 403, '请联系初始管理员')
+            if user_type == USER_TYPE_INITIAL_ADMIN or old_user_type == USER_TYPE_INITIAL_ADMIN: # 初始管理员一般建议只设置一个
+                return restful(user, 403, '不允许修改初始管理员')
         else:
-            redis_client.incr(f"vcode_fail_count:{recv_email}")
-        return restful(user, 400, "验证码错误或已失效")
+            user_type = USER_TYPE_INITIAL_ADMIN
+    input_code = None
+    if not can_bypass_vcode:
+        try:
+            input_code = int(item.get('code', ''))
+        except (ValueError, TypeError):
+            return restful(user, 400, '验证码必须为数字')
+        if int(vcode) != input_code:
+            if redis_client.get(f"vcode_fail_count:{recv_email}") >= MAX_VERIFY_FAIL_COUNT:
+                redis_client.delete(f"vcode:{recv_email}") # 超过最大次数，删除验证码
+                redis_client.delete(f"vcode_fail_count:{recv_email}")
+            else:
+                redis_client.incr(f"vcode_fail_count:{recv_email}")
+            return restful(user, 400, "验证码错误或已失效")
     try:
         # 检查unique_id有效性
         if operation != ACCOUNT_RESET_PASSWORD and (unique_id < 1 or unique_id > 2147483647):
@@ -550,7 +568,7 @@ async def bapi_verify(request: Request, user: User = Depends(get_current_user)):
         return restful(user, 500, f"{operation_name}失败: {str(e)}")
 
 @app.post('/bapi/search')
-@limiter.limit("1/second, 30/minute")
+@limiter.limit("2/second, 30/minute")
 async def bapi_search(request: Request, user: User = Depends(get_current_user)):
     """搜索黑名单接口"""
     try:
@@ -601,7 +619,7 @@ async def bapi_update(request: Request, user: User = Depends(get_current_user)):
         return restful(user, 400, '无效表')
     auth_info = blacklist_server.get_target_auth_info(uid, create_time)
     if auth_info != -1: # 已存在，认为是修改
-        if auth_info != user.qq_id and not user.type == USER_TYPE_ADMIN:
+        if auth_info != user.qq_id and not user.type not in (USER_TYPE_ADMIN, USER_TYPE_INITIAL_ADMIN):
             return restful(user, 403, '只能修改自己创建的记录')
     else: # 新增：只能新增到有权限修改的表
         try:
@@ -640,7 +658,7 @@ async def bapi_update(request: Request, user: User = Depends(get_current_user)):
         return restful(user, 400, '记录者QQ号必须为数字')
     except AssertionError:
         return restful(user, 400, '无效或未注册的记录者QQ号')
-    if recorder_qq_id != user.qq_id and not user.type == USER_TYPE_ADMIN:
+    if recorder_qq_id != user.qq_id and not user.type in (USER_TYPE_ADMIN, USER_TYPE_INITIAL_ADMIN):
         return restful(user, 403, '不能修改其他人的记录')
     remark = item.get('remark', '')
     if len(remark) > MAX_REMARK_LEN:
@@ -693,12 +711,12 @@ async def bapi_delete(request: Request, user: User = Depends(get_current_user)):
         return restful(user, 400, 'create_time无效')
     operator_qq_id = user.qq_id
     operator_type = user.type
-    is_admin = operator_type == USER_TYPE_ADMIN
+    is_admin = operator_type in (USER_TYPE_ADMIN, USER_TYPE_INITIAL_ADMIN)
     # 检查权限
     target_qq_id = blacklist_server.get_target_auth_info(uid, create_time)
     if target_qq_id == -1:
         return restful(user, 404, '记录不存在')
-    if not target_qq_id:
+    if not target_qq_id and not is_admin:
         return restful(user, 403, '请联系管理员以认领或修改无主记录')
     if target_qq_id != operator_qq_id and not is_admin:
         return restful(user, 403, '只能修改自己创建的记录')
@@ -768,7 +786,7 @@ async def config_page(request: Request):
 @app.get('/bapi/config')
 async def bapi_config(user: User = Depends(get_current_user)):
     '''获取配置信息'''
-    if user.type != USER_TYPE_ADMIN:
+    if user.type not in (USER_TYPE_ADMIN, USER_TYPE_INITIAL_ADMIN):
         return restful(user, 403, '权限不足')
     try:
         return restful(user, 200, '获取配置信息成功', config.config)
@@ -779,7 +797,7 @@ async def bapi_config(user: User = Depends(get_current_user)):
 async def bapi_update_config(request: Request, user: User = Depends(get_current_user)):
     '''更新配置信息'''
     item = await request.json()
-    if user.type != USER_TYPE_ADMIN:
+    if user.type not in (USER_TYPE_ADMIN, USER_TYPE_INITIAL_ADMIN):
         return restful(user, 403, '权限不足')
     try:
         config.update_config(item)
@@ -787,7 +805,7 @@ async def bapi_update_config(request: Request, user: User = Depends(get_current_
     except Exception as e:
         return restful(user, 400, f'更新配置信息失败：{e}')
 
-@app.post('/bapi/latest_log')
+@app.post('/bapi/latest_log') # 不是GET！get不能有body
 async def bapi_latest_log(request: Request, user: User = Depends(get_current_user)):
     '''获取最新日志'''
     item = await request.json()
@@ -795,7 +813,7 @@ async def bapi_latest_log(request: Request, user: User = Depends(get_current_use
     try:
         page = int(item['page'])
         limit = int(item['limit'])
-        max_tot = 20 if user.type != USER_TYPE_ADMIN else None
+        max_tot = 20 if user.type not in (USER_TYPE_ADMIN, USER_TYPE_INITIAL_ADMIN) else None
         return restful(user, 200, '获取日志成功', blacklist_server.get_latest_logs(limit, page, max_tot))
     except Exception as e:
         return restful(user, 400, f'获取日志失败：{e}')
@@ -810,9 +828,9 @@ async def submit_page(request: Request):
 
 @app.post('/oapi/bulk')
 async def bapi_bulk_add_user(request: Request, user: User = Depends(get_current_user)):
-    '''批量添加用户'''
+    '''批量添加用户(仅添加king权限组)'''
     item = await request.json()
-    if user.type != USER_TYPE_ADMIN:
+    if user.type not in (USER_TYPE_ADMIN, USER_TYPE_INITIAL_ADMIN):
         return restful(user, 403, '权限不足')
     try:
         user_list = item.get('qq', '').replace('\n','').split(',') # qq,nickname,qq,nickname...
@@ -821,7 +839,10 @@ async def bapi_bulk_add_user(request: Request, user: User = Depends(get_current_
                 continue
             qq_id = int(user_list[i])
             nickname = user_list[i+1]
-            blacklist_server.update_user(qq_id, 1, nickname, None, USER_TYPE_KING)
+            user_type = blacklist_server.get_register_type(qq_id)
+            if user_type not in (USER_TYPE_ADMIN, USER_TYPE_INITIAL_ADMIN):
+                user_type = USER_TYPE_KING
+            blacklist_server.update_user(qq_id, 1, nickname, None, user_type)
         return restful(user, 200, '批量添加用户成功')
     except Exception as e:
         return restful(user, 400, f'批量添加用户失败：{e}')
@@ -829,7 +850,7 @@ async def bapi_bulk_add_user(request: Request, user: User = Depends(get_current_
 @app.get('/oapi/count')
 async def bapi_count(user: User = Depends(get_current_user)):
     '''获取记录过黑名单的用户，按记录的多少排序'''
-    if user.type != USER_TYPE_ADMIN:
+    if user.type not in (USER_TYPE_ADMIN, USER_TYPE_INITIAL_ADMIN):
         return restful(user, 403, '权限不足')
     try:
         count_list = blacklist_server.get_count_list()
@@ -840,7 +861,7 @@ async def bapi_count(user: User = Depends(get_current_user)):
 @app.get('/oapi/repair')
 async def bapi_repair_blacklist(user: User = Depends(get_current_user)):
     '''修复黑名单'''
-    if user.type != USER_TYPE_ADMIN:
+    if user.type not in (USER_TYPE_ADMIN, USER_TYPE_INITIAL_ADMIN):
         return restful(user, 403, '权限不足')
     try:
         blacklist_server.repair_blacklist()
@@ -851,7 +872,7 @@ async def bapi_repair_blacklist(user: User = Depends(get_current_user)):
 @app.get('/oapi/download')
 async def blacklist(user: User = Depends(get_current_user)):
     '''下载黑名单数据库（用于备份）'''
-    if user.type != USER_TYPE_ADMIN:
+    if user.type not in (USER_TYPE_ADMIN, USER_TYPE_INITIAL_ADMIN):
         return restful(user, 403, '权限不足')
     try:
         # 将数据库文件返回给客户端
@@ -875,7 +896,7 @@ def reload():
 @app.post('/oapi/upload')
 async def bapi_upload(request: Request, user: User = Depends(get_current_user)):
     '''上传黑名单数据库（用于恢复）'''
-    if user.type != USER_TYPE_ADMIN:
+    if user.type != USER_TYPE_INITIAL_ADMIN: # 只有初始管理员可以上传数据库，因为可以覆盖任何权限组
         return restful(user, 403, '权限不足')
     try:
         # 接收上传的文件
@@ -892,7 +913,7 @@ async def bapi_upload(request: Request, user: User = Depends(get_current_user)):
 @app.get('/oapi/reload')
 async def bapi_reload(user: User = Depends(get_current_user)):
     '''重新加载黑名单数据库'''
-    if user.type != USER_TYPE_ADMIN:
+    if user.type not in (USER_TYPE_ADMIN, USER_TYPE_INITIAL_ADMIN):
         return restful(user, 403, '权限不足')
     try:
         reload()
@@ -905,12 +926,12 @@ async def bapi_reload(user: User = Depends(get_current_user)):
 async def bapi_export(request: Request, user: User = Depends(get_current_user)):
     '''将xlsx中的数据合并入内存,并导出黑名单静态查询资源'''
     # 每次要登录太麻烦,限制每天1次就好了,如果要本地模式多次就重启程序就好
-    # if user.type != USER_TYPE_ADMIN:
+    # if user.type not in (USER_TYPE_ADMIN, USER_TYPE_INITIAL_ADMIN):
     #     return restful(user, 403, '权限不足')
     try:
         logger.info("export request from %s", request.client.host)
         blacklist_server.read_blacklist_xlsx(config.blacklist_xlsx_path)
-
+        blacklist_server.export_black_list_to_db()
         blacklist_server.export_black_list_to_bin(config.blacklist_assets)
         return restful(user, 200, '导出成功')
     except Exception as e:

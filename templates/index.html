@@ -360,7 +360,6 @@
                 type="text"
                 id="key"
                 placeholder="搜索黑名单..."
-                onblur="search()"
               />
 
               <div class="btn-row">
@@ -1517,7 +1516,7 @@
           });
       }
       function getLatestLog(option = null) {
-        // GET /bapi/latest_log -> [(uid:int, create_time:timestamp, nickname:str, date:timestamp, reasons:str, recorder:str, recorder_qq_id:int, remark:str, last_edit_time, table_id, operation)]
+        // POST /bapi/latest_log -> [(uid:int, create_time:timestamp, nickname:str, date:timestamp, reasons:str, recorder:str, recorder_qq_id:int, remark:str, last_edit_time, table_id, operation)]
         const pageInfo = getPageInfo(option);
         fetch("/bapi/latest_log", {
           method: "POST",

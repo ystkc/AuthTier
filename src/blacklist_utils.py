@@ -19,12 +19,14 @@ USER_TYPE_NORMAL = 1
 USER_TYPE_KING = 2
 USER_TYPE_ACME = 3
 USER_TYPE_ADMIN = 99
+USER_TYPE_INITIAL_ADMIN = 100
 USER_TYPE_STR_MAP = {
     USER_TYPE_GUEST: '访客',
     USER_TYPE_NORMAL: '普通成员/非王者班长',
     USER_TYPE_KING: '王者班长',
     USER_TYPE_ACME: '百强班长',
-    USER_TYPE_ADMIN: '管理员'
+    USER_TYPE_ADMIN: '管理员',
+    USER_TYPE_INITIAL_ADMIN: '初始管理员',
 }
 
 class User(BaseModel):
@@ -75,11 +77,11 @@ class BlacklistServerClass:
         result = {
             'type': user_type,
             'type_name': USER_TYPE_STR_MAP[user_type],
-            'modify_other_users': user_type == USER_TYPE_ADMIN, # 管理员可以修改其他用户信息和改变其他用户类型
+            'modify_other_users': user_type in (USER_TYPE_ADMIN, USER_TYPE_INITIAL_ADMIN), # 管理员可以修改其他用户信息和改变其他用户类型
             'login_required': user_type == USER_TYPE_GUEST, # 访客需要登录
             'has_admin': self.has_admin, # 是否有管理员，如果没有，则要求立即注册一个管理员
             'admin_alert': '没有检测到管理员账号，请立即注册一个管理员账号' if not self.has_admin else '',
-            'admin_notice': '<u><b>您正在注册管理员账号。请注意：管理员可设置、取消其他管理员，无论注册顺序先后</b></u>'
+            'admin_notice': '<u>您正在注册管理员账号。<b>请注意：初始管理员可设置、取消其他管理员，普通管理员不可。</b>其余权限类似</u>'
                 if not self.has_admin else '',
             'tables': {}
         }
@@ -164,7 +166,7 @@ class BlacklistServerClass:
         self.user_name_to_id = {}
         self.has_admin = False
         for row in user_list:
-            if row[2] == USER_TYPE_ADMIN:
+            if row[2] == USER_TYPE_INITIAL_ADMIN:
                 self.has_admin = True
             self.user_dict[row[0]] = User(qq_id=row[0],
                 unique_id=row[1],
@@ -213,7 +215,7 @@ class BlacklistServerClass:
         '''将时间戳转换为字符串'''
         return datetime.datetime.strftime(
             datetime.datetime.fromtimestamp(timestamp),
-            '%Y/%m/%d %H:%M:%S')
+            '%Y/%m/%d %H:%M:%S').replace('/0','/')
 
     def chkdiff(self, old_tp, new_tp):
         '''检查两个tp是否相同(除了last_edit_time)'''
@@ -415,6 +417,8 @@ class BlacklistServerClass:
                 print(f"{uid} 未填写退班时间，跳过")
                 continue
             nickname = row[0].value
+            if not nickname:
+                nickname = "(未知昵称)"
             create_time = date = int(row[2].value.timestamp())
             recorder = row[4].value
             recorder_qq_id = self.user_name_to_id.get(row[4].value, None)
@@ -423,9 +427,6 @@ class BlacklistServerClass:
                 tp = self.blacklist.get(uid, {}).get(create_time, None)
                 if tp:
                     recorder_qq_id = tp[6]
-
-            if self.check_exist(uid, date):
-                continue
 
             reason = ""
             if row[3].value is not None:
@@ -444,17 +445,23 @@ class BlacklistServerClass:
             #     first_editor = (row[8].value)
             # except:
             #     first_editor = ('无')
-            self.update_blacklist((uid,
-                create_time,
-                nickname,
-                date,
-                reason,
-                recorder,
-                recorder_qq_id,
-                remark,
-                last_edit_time,
-                TABLE_TYPE_KING),
-                system_user)
+            # 已存在的记录也必须参与导入：XLSX 可能修改昵称、原因、备注等字段。
+            # update_blacklist 会在内容完全相同时抛出 ValueError，此时仅跳过该行。
+            try:
+                self.update_blacklist((uid,
+                    create_time,
+                    nickname,
+                    date,
+                    reason,
+                    recorder,
+                    recorder_qq_id,
+                    remark,
+                    last_edit_time,
+                    TABLE_TYPE_KING),
+                    system_user)
+            except ValueError as exc:
+                if "记录没有修改" not in str(exc):
+                    raise
 
     def refresh_jwt_secret(self):
         '''刷新jwt_secret，用于外部有人修改密码时手动调用'''
@@ -551,7 +558,7 @@ class BlacklistServerClass:
         self.logger.info("数据库重载完成")
 
     def prepare(self):
-        '''全局准备函数（原因、用户数据、数据库和导入xlsx文件）'''
+        '''全局准备函数（原因、用户数据、数据库，【不包含】导入xlsx文件）'''
         if not self.__ready:
             self.logger.info("正在读取 黑名单数据")
             conn = sqlite3.connect(self.blacklist_db_path, detect_types=0)
@@ -693,7 +700,7 @@ class BlacklistServerClass:
         conn.commit()
         cursor.close()
         conn.close()
-        if new_type == USER_TYPE_ADMIN:
+        if new_type == USER_TYPE_INITIAL_ADMIN:
             self.has_admin = True
         self.user_dict[qq_id] = User(qq_id=qq_id,
             unique_id=unique_id,
@@ -783,7 +790,7 @@ class BlacklistServerClass:
     def get_register_type(self, qq_id):
         '''根据用户提供的邮箱判断即将注册的类型'''
         if not self.has_admin:
-            return USER_TYPE_ADMIN, USER_TYPE_STR_MAP[USER_TYPE_ADMIN]
+            return USER_TYPE_INITIAL_ADMIN, USER_TYPE_STR_MAP[USER_TYPE_INITIAL_ADMIN]
         tp = self.user_dict.get(qq_id, None)
         if not tp:
             return USER_TYPE_NORMAL, USER_TYPE_STR_MAP[USER_TYPE_NORMAL]

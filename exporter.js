@@ -37,7 +37,7 @@ function runn() {
     const nickname = nicknameSpan ? nicknameSpan.textContent.trim().split('#')[0].split('＃')[0] : null;
 
     // 输出格式化结果
-    if (qqId && nickname) {
+    if (true) {
         result += (`${qqId},${nickname},\n`);
     }
     });
@@ -53,3 +53,4 @@ observer.observe(element, {
   characterData: true   // 监听文本内容变化
 });
 runn();
+// 导入节点是/submit
